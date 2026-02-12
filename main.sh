@@ -239,159 +239,110 @@ EOF
 chmod +x "$USB_RUN_SCRIPT"
 log_info "Created launch script on USB: $USB_RUN_SCRIPT"
 
-# Extract Vendor/Product ID for Udev
-log_info "Extracting device identifiers for autorun configuration..."
+    # Setup Autorun (Udev + Systemd)
+    log_info "Configuring systemd and udev rules..."
 
-eval "$(udevadm info -q property -n "$DEVICE_PATH" | grep -E 'ID_VENDOR_ID|ID_MODEL_ID')"
-DEVICE_VID=${ID_VENDOR_ID:-}
-DEVICE_PID=${ID_MODEL_ID:-}
-
-if [[ -z "$DEVICE_VID" || -z "$DEVICE_PID" ]]; then
-    log_warn "Udev properties missing. Attempting fallback using lsusb..."
-    # This grep is weak, relies on name match
-    USB_INFO=$(lsusb | grep -i "${DEVICE_NAME}" || true) 
-    log_error "Could not automatically detect VID/PID. Autorun configuration skipped."
-else
-    log_info "Detected: VID=$DEVICE_VID PID=$DEVICE_PID"
-
-    # Setup Autorun (Udev + Wrapper)
-    # Using generalized filenames
-    SYSTEM_AUTORUN_SCRIPT="/usr/local/bin/electrum-usb-launcher.sh"
-    RULES_FILE="${UDEV_RULES_DIR}/99-electrum-usb.rules"
-
-    log_info "Creating system autorun wrapper..."
+    # Define paths
+    UDEV_RULE_FILE="/etc/udev/rules.d/99-electrum-usb.rules"
+    SERVICE_ADD_FILE="/etc/systemd/system/usb-app-add.service"
+    SERVICE_REMOVE_FILE="/etc/systemd/system/usb-app-remove.service"
+    SCRIPT_ADD_FILE="/usr/local/bin/usb-app-add.sh"
+    SCRIPT_REMOVE_FILE="/usr/local/bin/usb-app-remove.sh"
     
-    cat <<'EOF' > "$SYSTEM_AUTORUN_SCRIPT"
+    # Determine the target user (the one running sudo)
+    TARGET_USER="${SUDO_USER:-$(whoami)}"
+    log_info "Target user for desktop entry: $TARGET_USER"
+
+    # 1. Create Udev Rule
+    log_info "Creating udev rule: $UDEV_RULE_FILE"
+    cat <<EOF > "$UDEV_RULE_FILE"
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", TAG+="systemd", ENV{SYSTEMD_WANTS}="usb-app-add.service"
+ACTION=="remove", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{DEVTYPE}=="partition", TAG+="systemd", ENV{SYSTEMD_WANTS}="usb-app-remove.service"
+EOF
+
+    # 2. Create Systemd Service (Add)
+    log_info "Creating service: $SERVICE_ADD_FILE"
+    cat <<EOF > "$SERVICE_ADD_FILE"
+[Unit]
+Description=Create desktop entry for USB AppImage
+
+[Service]
+Type=oneshot
+ExecStart=$SCRIPT_ADD_FILE
+EOF
+
+    # 3. Create Systemd Service (Remove)
+    log_info "Creating service: $SERVICE_REMOVE_FILE"
+    cat <<EOF > "$SERVICE_REMOVE_FILE"
+[Unit]
+Description=Remove desktop entry for USB AppImage
+
+[Service]
+Type=oneshot
+ExecStart=$SCRIPT_REMOVE_FILE
+EOF
+
+    # 4. Create Script (Add)
+    log_info "Creating script: $SCRIPT_ADD_FILE"
+    cat <<EOF > "$SCRIPT_ADD_FILE"
 #!/bin/bash
-# Wrapper script triggered by Udev for Electrum USB
-# Logs to syslog via logger
 
-log() {
-    logger -t electro-usb "$1"
-    echo "$1"
-}
+USER_NAME="$TARGET_USER"
+APP_DIR="/home/\$USER_NAME/.local/share/applications"
+DESKTOP_FILE="\$APP_DIR/usb-app.desktop"
 
-log "Device detected, script triggered."
+# Wait for mount point to appear (max 10 seconds)
+# systemd triggers this immediately on device insertion, but auto-mount takes a moment
+for i in {1..10}; do
+    # 1. lsblk -n -o MOUNTPOINT,TRAN: Lists mountpoints and transport
+    # 2. grep ' usb$': Filters lines ending in ' usb' (USB transport)
+    # 3. awk '\$1 ~ /^\// {print \$1}': Prints first column ONLY if it starts with / (absolute path)
+    MOUNT=\$(lsblk -n -o MOUNTPOINT,TRAN | grep ' usb$' | awk '\$1 ~ /^\// {print \$1}' | head -n1)
 
-# Wait for mount to settle
-sleep 5
-
-# Find the active X11/Wayland user
-# This function tries multiple methods to find the user currently on the physical seat
-get_active_user() {
-    # Method 1: loginctl
-    local user=$(loginctl list-sessions 2>/dev/null | grep 'active' | awk '{print $3}' | head -n 1)
-    if [[ -n "$user" ]]; then
-        echo "$user"
-        return
+    if [ -n "\$MOUNT" ]; then
+        break
     fi
-    # Method 2: who (fallback)
-    local user_who=$(who | grep '(:0)' | awk '{print $1}' | head -n 1)
-    if [[ -n "$user_who" ]]; then
-        echo "$user_who"
-        return
-    fi
-
-    # Method 3: whoami
-    local user_whoami=$(whoami) 
-    if [[ -n "$user_whoami" ]]; then
-        echo "$user_whoami"
-        return
-    fi
-}
-
-TARGET_USER=$(get_active_user)
-echo "Active user: $TARGET_USER"
-if [[ -z "$TARGET_USER" ]]; then
-    log "No active GUI user found. Aborting."
-    exit 0
-fi
-
-log "Active user detected: $TARGET_USER"
-
-# Dynamic Mount Point Detection
-CANDIDATE_SCRIPT=""
-
-# Search common mount points for the user
-for mount in $(find /media/$TARGET_USER /mnt /run/media/$TARGET_USER -maxdepth 4 -name "run_electrum.sh" 2>/dev/null); do
-    CANDIDATE_SCRIPT="$mount"
-    break
+    sleep 1
 done
 
-if [[ -z "$CANDIDATE_SCRIPT" || ! -f "$CANDIDATE_SCRIPT" ]]; then
-    log "Could not find run_electrum.sh in standard locations. ($CANDIDATE_SCRIPT)"
-    exit 0
-fi
-
-log "Found launch script at: $CANDIDATE_SCRIPT"
-
-if [[ -z "$CANDIDATE_SCRIPT" || ! -f "$CANDIDATE_SCRIPT" ]]; then
-    log "Could not find run_electrum.sh in standard locations. ($CANDIDATE_SCRIPT)"
-    exit 0
-fi
-
-log "Found launch script at: $CANDIDATE_SCRIPT"
-
-# --- DE Integration: Install .desktop file (Portable to System) ---
-USB_MOUNT_DIR=$(dirname "$CANDIDATE_SCRIPT")
-DESKTOP_DIR="/home/$TARGET_USER/.local/share/applications"
-SYSTEM_DESKTOP_FILE="$DESKTOP_DIR/electrum-usb.desktop"
-
-if [[ -d "$DESKTOP_DIR" ]]; then
-    log "Installing desktop entry to $SYSTEM_DESKTOP_FILE..."
-    
-    # We create a new desktop file to ensure the Exec path is absolute and correct for this mount
-    cat <<DE_EOF > "$SYSTEM_DESKTOP_FILE"
-[Desktop Entry]
-Name=Electrum Wallet (USB)
-Comment=Portable Electrum Wallet from USB
-Exec="$CANDIDATE_SCRIPT"
-Icon=electrum
+if [ -n "\$MOUNT" ]; then
+    APP=\$(find "\$MOUNT" -maxdepth 2 -name "*.AppImage" | head -n1)
+    if [ -n "\$APP" ]; then
+        echo "[Desktop Entry]
+Name=USB App
+Exec=\$APP
+Icon=application-x-executable
 Type=Application
-Terminal=false
-Categories=Finance;Network;
-DE_EOF
+Terminal=false" > "\$DESKTOP_FILE"
 
-    # Fix ownership so it's user-writable/executable
-    chown "$TARGET_USER:$(id -g $TARGET_USER)" "$SYSTEM_DESKTOP_FILE"
-    chmod +x "$SYSTEM_DESKTOP_FILE"
-    
-    # Notify DE of updates (optional/if dbus is available)
-    # update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+        chmod +x "\$DESKTOP_FILE"
+        chown "\$USER_NAME:\$(id -g \$USER_NAME)" "\$DESKTOP_FILE"
+    else
+        echo "No AppImage found in \$MOUNT"
+    fi
 else
-    log "User applications directory not found: $DESKTOP_DIR"
-fi
-# ------------------------------------------------------------------
-
-export DISPLAY=:0
-export XAUTHORITY="/home/$TARGET_USER/.Xauthority"
-export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u $TARGET_USER)/bus"
-
-log "Launching application..."
-
-if [[ "$TARGET_USER" != "$(whoami)" ]]; then
-    su - "$TARGET_USER" -c "\"$CANDIDATE_SCRIPT\"" &
-else
-    "$CANDIDATE_SCRIPT" &
+    echo "No USB mount point found after waiting."
 fi
 EOF
 
-    chmod +x "$SYSTEM_AUTORUN_SCRIPT"
+    # 5. Create Script (Remove)
+    log_info "Creating script: $SCRIPT_REMOVE_FILE"
+    cat <<EOF > "$SCRIPT_REMOVE_FILE"
+#!/bin/bash
 
-    log_info "Creating udev rule..."
-    
-    cat <<EOF > "$RULES_FILE"
-SUBSYSTEM=="usb", ACTION=="add", ATTR{idVendor}=="$DEVICE_VID", ATTR{idProduct}=="$DEVICE_PID", RUN+=   "$SYSTEM_AUTORUN_SCRIPT"
+USER_NAME="$TARGET_USER"
+rm -f "/home/\$USER_NAME/.local/share/applications/usb-app.desktop"
 EOF
 
-    log_info "Reloading udev rules..."
-    udevadm control --reload-rules
-    udevadm trigger
+# 6. Set Permissions & Reload
+log_info "Setting permissions and reloading daemons..."
+chmod +x "$SCRIPT_ADD_FILE" "$SCRIPT_REMOVE_FILE"
 
-    log_info "Autorun configured successfully."
-    log_info "Wrapper: $SYSTEM_AUTORUN_SCRIPT"
-    log_info "Rule: $RULES_FILE"
-fi
+systemctl daemon-reload
+udevadm control --reload
+udevadm trigger
+
+log_info "Autorun configuration complete."
 
 log_info "Unmounting $MOUNT_POINT..."
 umount "$MOUNT_POINT" || log_warn "Failed to unmount. Please unmount manually."
